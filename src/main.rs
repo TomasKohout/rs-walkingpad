@@ -5,6 +5,7 @@ use btleplug::api::{Central, Characteristic, Manager as _, Peripheral, ScanFilte
 use btleplug::platform::Manager;
 extern crate derive_more;
 use derive_more::{Add, Display, Error as DError, From, Into};
+use futures::select;
 use futures::StreamExt;
 use std::error::Error;
 use std::path::PathBuf;
@@ -13,13 +14,33 @@ use std::time::Duration;
 use structopt::StructOpt;
 use tokio::time;
 
+use signal_hook::consts::signal::*;
+use signal_hook_tokio::Signals;
+
 mod controller;
 
-use controller::controller::*;
+use controller::*;
+
+async fn handle_signals(mut signals: Signals) {
+    while let Some(signal) = signals.next().await {
+        match signal {
+            SIGHUP => {
+                // Reload configuration
+                // Reopen the log file
+            }
+            SIGTERM | SIGINT | SIGQUIT => break,
+            _ => unreachable!(),
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     pretty_env_logger::init();
+
+    let signals = Signals::new(&[SIGHUP, SIGTERM, SIGINT, SIGQUIT])?;
+    let handle = signals.handle();
+    let signals_task = tokio::spawn(handle_signals(signals));
 
     let manager = Manager::new().await?;
     let adapter_list = manager.adapters().await?;
@@ -75,16 +96,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let k = pad.gets().await?;
             tokio::spawn(async move {
                 k.for_each(|data| async move {
-                    println!("Received data [{:?}]: {:?}", data.uuid, data.value)
+                    let res = State::new(data.value);
+                    println!("Received data [{:?}]: {:?}", data.uuid, res)
                 })
                 .await
             });
 
-            pad.ask_stats().await?;
-            std::thread::sleep(Duration::from_secs(5));
-            pad.ask_profile().await?;
-
-            std::thread::sleep(time::Duration::from_secs(5));
+            let j = tokio::spawn(async move {
+                loop {
+                    pad.ask_stats().await;
+                    std::thread::sleep(Duration::from_millis(500))
+                }
+            });
 
             // pad.switch_mode(Mode::Manual).await?;
 
@@ -92,11 +115,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
             // pad.start_belt().await?;
 
-            // std::thread::sleep(time::Duration::from_secs(10));
+            signals_task.await?;
+            j.abort();
+            // walkingpad.connect().await?;
+            // pad.stop_belt().await?;
 
-            pad.stop_belt().await?;
-
-            pad.disconnect().await;
+            // pad.disconnect().await;
         } else {
             println!("Not found.")
         }

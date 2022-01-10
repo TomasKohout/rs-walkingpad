@@ -14,3 +14,6 @@ derive_more = "0.99.17"
 structopt = { version = "0.3" }
 async-trait = "0.1.52"
 futures = "0.3"
+signal-hook-tokio = {version = "0.3", features = ["futures-v0_3"]}
+signal-hook = "0.3"
+warp = "0.3"
