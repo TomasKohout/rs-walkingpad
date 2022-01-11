@@ -1,30 +1,47 @@
-mod enums;
+pub mod enums;
 use enums::*;
 
 mod error;
 use error::*;
 
+use log::{info, trace, warn};
+
 use btleplug::api::{Characteristic, Peripheral, ValueNotification};
 use std::collections::BTreeSet;
 use std::error::Error;
+use std::ops::Sub;
 
 use futures::stream::Stream;
 
-use tokio::sync::watch::Sender;
-
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::time::SystemTime;
+use tokio::sync::watch::Sender;
+use tokio::sync::{Mutex, RwLock};
 
 use std::pin::Pin;
 
 const FE01: &str = "0000fe01";
 const FEO2: &str = "0000fe02";
+const MIN_TIME_BETWEEN_CMDS: u128 = 890;
+
+impl<T: Peripheral> Clone for Pad<T> {
+    fn clone(&self) -> Self {
+        Self {
+            char_fe01: self.char_fe01.clone(),
+            char_fe02: self.char_fe02.clone(),
+            peripheral: Arc::clone(&self.peripheral),
+            subscribers: Arc::clone(&self.subscribers),
+            last_time: Arc::clone(&self.last_time),
+        }
+    }
+}
 #[derive(Debug)]
 pub struct Pad<T: Peripheral> {
     char_fe01: Characteristic,
     char_fe02: Characteristic,
-    peripheral: T,
+    peripheral: Arc<Mutex<T>>,
     subscribers: Arc<RwLock<Vec<Sender<Message>>>>,
+    last_time: Arc<Mutex<u128>>,
 }
 impl<T: Peripheral> Pad<T> {
     pub async fn new(peripheral: &T) -> Result<Pad<T>, Box<dyn Error>> {
@@ -33,7 +50,7 @@ impl<T: Peripheral> Pad<T> {
         if !is_connected {
             let connected = peripheral.connect().await;
             match connected {
-                Ok(_) => println!("Connected!"),
+                Ok(_) => info!("Connected!"),
                 Err(e) => {
                     return Err(Box::new(MyError {
                         details: e.to_string(),
@@ -52,69 +69,54 @@ impl<T: Peripheral> Pad<T> {
         Ok(Pad {
             char_fe01: char01,
             char_fe02: char02,
-            peripheral: peripheral.clone(),
+            peripheral: Arc::new(Mutex::new(peripheral.clone())),
             subscribers: Arc::new(RwLock::new(vec![])),
+            last_time: Arc::new(Mutex::new(0)),
         })
     }
 
     pub async fn stop_belt(&self) -> Result<(), btleplug::Error> {
-        self.change_speed(Speed::Zero).await
+        self.change_speed(0).await
     }
 
     pub async fn start_belt(&self) -> Result<(), btleplug::Error> {
         let cmd = [247, 162, 4, 1, 255, 253];
-        let cmd = [247, 162, 4, 1, Pad::<T>::crc(&cmd), 253];
-        self.peripheral
-            .write(
-                &self.char_fe02,
-                &cmd,
-                btleplug::api::WriteType::WithoutResponse,
-            )
-            .await
+        info!("Starting belt");
+        self.send(&cmd).await
     }
 
     pub async fn switch_mode(&self, mode: Mode) -> Result<(), btleplug::Error> {
         let m = mode as u8;
         let cmd: [u8; 6] = [247, 162, 2, m, 255, 253];
-        let cmd: [u8; 6] = [247, 162, 2, m, Pad::<T>::crc(&cmd), 253];
-        self.peripheral
-            .write(
-                &self.char_fe02,
-                &cmd,
-                btleplug::api::WriteType::WithoutResponse,
-            )
-            .await
+        info!("Switching mode");
+        self.send(&cmd).await
     }
 
     pub async fn change_speed(&self, speed: u8) -> Result<(), btleplug::Error> {
         let cmd = [247, 162, 1, speed, 255, 253];
-        let cmd = [247, 162, 1, speed, Pad::<T>::crc(&cmd), 253];
-
-        self.peripheral
-            .write(
-                &self.char_fe02,
-                &cmd,
-                btleplug::api::WriteType::WithoutResponse,
-            )
-            .await
+        info!("Changing speed to {}", speed);
+        self.send(&cmd).await
     }
 
     pub async fn disconnect(&self) {
+        info!("Disconnecting");
         self.peripheral
+            .lock()
+            .await
             .disconnect()
             .await
             .expect("Error disconnecting from BLE peripheral");
     }
 
     pub async fn services(&self) {
-        println!("Discover peripheral services...");
-        for service in self.peripheral.services() {
-            println!(
+        info!("Discover peripheral services...");
+        for service in self.peripheral.lock().await.services() {
+            info!(
                 "Service UUID {}, primary: {}",
                 service.uuid, service.primary
             );
             for characteristic in service.characteristics {
-                println!("  {:?}", characteristic);
+                info!("  {:?}", characteristic);
             }
         }
     }
@@ -124,19 +126,68 @@ impl<T: Peripheral> Pad<T> {
     }
 
     pub async fn subs(&self) -> Result<(), btleplug::Error> {
-        self.peripheral.subscribe(&self.char_fe01).await
+        info!("Subscribing");
+        self.peripheral
+            .lock()
+            .await
+            .subscribe(&self.char_fe01)
+            .await
     }
 
     pub async fn gets(
         &self,
     ) -> Result<Pin<Box<dyn Stream<Item = ValueNotification> + Send>>, btleplug::Error> {
-        self.peripheral.notifications().await
+        self.peripheral.lock().await.notifications().await
     }
 
     pub async fn ask_stats(&self) -> Result<(), btleplug::Error> {
         let cmd: [u8; 6] = [247, 162, 0, 0, 162, 253];
-        let cmd = [247, 162, 0, 0, Pad::<T>::crc(&cmd), 253];
-        self.peripheral
+        info!("Asking stats");
+        self.send(&cmd).await
+    }
+
+    async fn send(&self, msg: &[u8]) -> Result<(), btleplug::Error> {
+        let cmd = [
+            msg[..msg.len() - 2].to_vec(),
+            [Pad::<T>::crc(msg), msg[msg.len() - 1]].to_vec(),
+        ]
+        .concat();
+
+        let device = self.peripheral.lock().await;
+        let mut last_time = self.last_time.lock().await;
+
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+
+        if *last_time != 0 {
+            match now.checked_sub(*last_time) {
+                Some(already_waited) => {
+                    info!("Already waited {}", already_waited);
+                    if already_waited < MIN_TIME_BETWEEN_CMDS {
+                        info!("Sleeping for {}", MIN_TIME_BETWEEN_CMDS - already_waited);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(
+                            (MIN_TIME_BETWEEN_CMDS - already_waited) as u64,
+                        ))
+                        .await
+                    }
+                }
+                None => {
+                    info!("Sleeping for {}", MIN_TIME_BETWEEN_CMDS);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(
+                        (MIN_TIME_BETWEEN_CMDS) as u64,
+                    ))
+                    .await
+                }
+            }
+        } else {
+            info!("Not sleeping for the first command");
+        }
+
+        *last_time = now;
+
+        device
             .write(
                 &self.char_fe02,
                 &cmd,
@@ -147,14 +198,7 @@ impl<T: Peripheral> Pad<T> {
 
     pub async fn ask_profile(&self) -> Result<(), btleplug::Error> {
         let cmd = [247, 165, 96, 74, 77, 147, 113, 41, 201, 253];
-        let cmd = [247, 165, 96, 74, 77, 147, 113, 41, Pad::<T>::crc(&cmd), 253];
-        self.peripheral
-            .write(
-                &self.char_fe02,
-                &cmd,
-                btleplug::api::WriteType::WithoutResponse,
-            )
-            .await
+        self.send(&cmd).await
     }
 
     async fn get_char(
@@ -173,11 +217,10 @@ impl<T: Peripheral> Pad<T> {
     }
 
     fn crc(cmd: &[u8]) -> u8 {
-        let k = cmd[1..cmd.len() - 2]
+        cmd[1..cmd.len() - 2]
             .to_vec()
             .iter()
-            .fold(0, |acc: u32, val| acc + *val as u32);
-        (k as u32).rem_euclid(256) as u8
+            .fold(0, |acc: u32, val| acc + *val as u32) as u8
     }
 
     // fn set_pref_arr(key: u8, arr: &[u8]) -> [u8] {

@@ -20,6 +20,9 @@ use signal_hook_tokio::Signals;
 mod controller;
 
 use controller::*;
+extern crate pretty_env_logger;
+#[macro_use]
+extern crate log;
 
 async fn handle_signals(mut signals: Signals) {
     while let Some(signal) = signals.next().await {
@@ -36,7 +39,7 @@ async fn handle_signals(mut signals: Signals) {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    pretty_env_logger::init();
+    pretty_env_logger::init_timed();
 
     let signals = Signals::new(&[SIGHUP, SIGTERM, SIGINT, SIGQUIT])?;
     let handle = signals.handle();
@@ -50,7 +53,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let adapter = adapter_list[0].clone();
 
-    println!("Starting scan on {}...", adapter.adapter_info().await?);
+    info!("Starting scan on {}...", adapter.adapter_info().await?);
     adapter
         .start_scan(ScanFilter::default())
         .await
@@ -77,7 +80,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                     }
                     Err(e) => {
-                        println!("ERROR {}", e);
+                        info!("ERROR {}", e);
                     }
                 }
             }
@@ -97,32 +100,37 @@ async fn main() -> Result<(), Box<dyn Error>> {
             tokio::spawn(async move {
                 k.for_each(|data| async move {
                     let res = State::new(data.value);
-                    println!("Received data [{:?}]: {:?}", data.uuid, res)
+                    info!("Received data [{:?}]: {:?}", data.uuid, res)
                 })
                 .await
             });
 
+            info!("connected {}", walkingpad.is_connected().await?);
+            pad.start_belt().await?;
+            pad.switch_mode(controller::enums::Mode::Manual).await?;
+
+            let pad_clone = pad.clone();
             let j = tokio::spawn(async move {
                 loop {
-                    pad.ask_stats().await;
-                    std::thread::sleep(Duration::from_millis(500))
+                    info!("Asking stats");
+                    pad_clone.ask_stats().await;
+                    std::thread::sleep(Duration::from_millis(750))
                 }
             });
 
             // pad.switch_mode(Mode::Manual).await?;
-
-            // pad.change_speed(Speed::Two).await?;
-
-            // pad.start_belt().await?;
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+            pad.change_speed(25).await?;
 
             signals_task.await?;
             j.abort();
             // walkingpad.connect().await?;
             // pad.stop_belt().await?;
 
-            // pad.disconnect().await;
+            pad.stop_belt().await?;
+            pad.disconnect().await;
         } else {
-            println!("Not found.")
+            info!("Not found.")
         }
     }
 
