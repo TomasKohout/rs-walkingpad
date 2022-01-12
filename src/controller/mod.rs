@@ -186,7 +186,10 @@ impl<T: Peripheral> Pad<T> {
             info!("Not sleeping for the first command");
         }
 
-        *last_time = now;
+        *last_time = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
 
         info!("NEW last_time {}", *last_time);
 
