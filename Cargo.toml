@@ -17,3 +17,4 @@ futures = "0.3"
 signal-hook-tokio = {version = "0.3", features = ["futures-v0_3"]}
 signal-hook = "0.3"
 warp = "0.3"
+serde = "1"

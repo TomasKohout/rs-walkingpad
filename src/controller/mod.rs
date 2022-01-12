@@ -22,7 +22,7 @@ use std::pin::Pin;
 
 const FE01: &str = "0000fe01";
 const FEO2: &str = "0000fe02";
-const MIN_TIME_BETWEEN_CMDS: u128 = 890;
+const MIN_TIME_BETWEEN_CMDS: u128 = 690;
 
 impl<T: Peripheral> Clone for Pad<T> {
     fn clone(&self) -> Self {
@@ -155,6 +155,7 @@ impl<T: Peripheral> Pad<T> {
 
         let device = self.peripheral.lock().await;
         let mut last_time = self.last_time.lock().await;
+        info!("OLD last_time {}", *last_time);
 
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -186,6 +187,8 @@ impl<T: Peripheral> Pad<T> {
         }
 
         *last_time = now;
+
+        info!("NEW last_time {}", *last_time);
 
         device
             .write(

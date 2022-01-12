@@ -13,13 +13,17 @@ use std::pin::Pin;
 use std::time::Duration;
 use structopt::StructOpt;
 use tokio::time;
+use warp::Filter;
 
 use signal_hook::consts::signal::*;
 use signal_hook_tokio::Signals;
 
 mod controller;
-
 use controller::*;
+
+mod http;
+use http::filters::*;
+
 extern crate pretty_env_logger;
 #[macro_use]
 extern crate log;
@@ -92,6 +96,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         if let Some(walkingpad) = walkingpad {
             let pad = Pad::new(&walkingpad).await?;
 
+            let api = http::filters::walkingpad(pad.clone());
+            tokio::spawn(async move {
+                let routes = api.with(warp::log("walkingpad"));
+                warp::serve(routes).run(([127, 0, 0, 1], 3030)).await;
+            });
             pad.services().await;
 
             pad.subs().await?;
@@ -106,15 +115,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
             });
 
             info!("connected {}", walkingpad.is_connected().await?);
-            pad.start_belt().await?;
+            // pad.start_belt().await?;
             pad.switch_mode(controller::enums::Mode::Manual).await?;
 
             let pad_clone = pad.clone();
             let j = tokio::spawn(async move {
                 loop {
-                    info!("Asking stats");
                     pad_clone.ask_stats().await;
-                    std::thread::sleep(Duration::from_millis(750))
+                    tokio::time::sleep(Duration::from_millis(750)).await;
                 }
             });
 
